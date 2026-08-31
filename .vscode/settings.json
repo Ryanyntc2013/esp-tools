@@ -1,0 +1,17 @@
+{
+  "idf.espIdfPath": "E:\\Espressif\\esp-idf",
+  "idf.toolsPath": "C:\\Users\\lidf\\.espressif",
+  "idf.pythonInstallPath": "C:\\Users\\lidf\\.espressif\\python_env\\idf6.2_py3.14_env",
+  "idf.port": "COM20",
+  "idf.adapterTargetName": "esp32s3",
+  "idf.flashType": "UART",
+  "idf.openOcdConfigs": [
+    "board/esp32s3-builtin.cfg"
+  ],
+  "idf.customExtraVars": {},
+  "clangd.path": "C:\\Espressif\\tools\\esp-clangd\\esp-21.1.3_20260408\\esp-clangd\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**"
+  ]
+}

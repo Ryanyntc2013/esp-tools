@@ -1,0 +1,47 @@
+# ESP-IDF 构建产物（每个子项目独立 build/）
+build/
+.cache/
+sdkconfig
+sdkconfig.old
+managed_components/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# 抓包/测试输出（保留 tools 源码，忽略运行时产物）
+*.pcap
+!projects/wifi_sniffer/login_ch3.pcap
+!projects/wifi_sniffer/mini6207_hs.pcap
+*.bin
+*.elf
+*.map
+*.log
+*_out.txt
+capture.*
+hdr_out.txt
+probe_out.txt
+qtest_out.txt
+scan_out.txt
+stdin_test_out.txt
+wprobe_out.txt
+p25q*.bin
+verification*.log
+
+# 编辑器/OS
+.vscode/ipch/
+.clangd/cache/
+*.code-workspace
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# 临时
+*.tmp
+*.bak
+*.swp
+*~
