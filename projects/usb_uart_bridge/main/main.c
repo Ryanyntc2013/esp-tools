@@ -1,16 +1,23 @@
 /*
  * USB 复合设备：2 路 CDC-ACM 虚拟串口 <-> 2 路 UART 3.3V TTL 双向透传桥
+ *              + 2 路复位输出（AT 指令控制）
  *
  * - 原生 USB (GPIO19/20) 枚举为复合设备，出现 2 个独立 COM 口：
  *     CDC0 (COMx) <-> UART1: TX=GPIO17, RX=GPIO18
  *     CDC1 (COMy) <-> UART2: TX=GPIO15, RX=GPIO16
  * - 各通道主机端设置的波特率等参数独立同步到对应 UART
+ * - 两个 CDC 口均解析 AT 复位指令，响应返回原端口；协议见 docs/at-rst-control.md
+ * - 复位输出 GPIO4/GPIO5：默认电平、脉冲宽度、双路间隔均可运行时配置
  * - ESP32-S3 USB 端点限制：TINYUSB_CDC_COUNT 最大为 2
  */
 #include <stdint.h>
+#include <inttypes.h>
+#include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "freertos/ringbuf.h"
 #include "esp_log.h"
 #include "esp_err.h"
@@ -23,6 +30,12 @@
 #include "esp_rom_sys.h"
 
 #define NUM_CDC             2
+
+#define RESET_PIN_1         4
+#define RESET_PIN_2         5
+#define RESET_INTERVAL_MS_DEFAULT 100
+#define RESET_PULSE_MS_DEFAULT    100
+#define RESET_DEFAULT_LEVEL_DEFAULT 0
 
 #define BRIDGE_UART_BAUD    115200
 #define UART_RX_RING_SIZE   (8 * 1024)  /* UART->USB 环形缓冲，吸收 USB 空闲期突发 */
@@ -44,10 +57,125 @@ static const char *TAG = "bridge";
 static RingbufHandle_t s_uart_rx_ring[NUM_CDC];
 static volatile bool s_usb_opened[NUM_CDC];  /* 主机已打开端口(DTR=1)才向 USB 转发 */
 
-/* ---------------- 诊断命令（CDC0 输入） ----------------
- * 'lb'  : 内部环回自检（UART TX->RX 本地回环，无需跳线）
- * 'dl'  : 软复位进下载模式（TinyUSB 接管 PHY 后 USJ 消失，烧录用）
- */
+typedef struct {
+    uint32_t interval_ms;
+    uint32_t pulse_ms;
+    uint8_t default_level;
+} reset_cfg_t;
+
+static reset_cfg_t s_reset_cfg = {
+    RESET_INTERVAL_MS_DEFAULT,
+    RESET_PULSE_MS_DEFAULT,
+    RESET_DEFAULT_LEVEL_DEFAULT,
+};
+static QueueHandle_t s_reset_queue;
+
+typedef struct {
+    int itf;
+    char order[3];
+} reset_cmd_t;
+
+/* ---------------- 复位与 AT 控制 ---------------- */
+
+static void cdc_reply(int itf, const char *text)
+{
+    tinyusb_cdcacm_write_queue(itf, (const uint8_t *)text, strlen(text));
+    tinyusb_cdcacm_write_queue(itf, (const uint8_t *)"\r\n", 2);
+    tinyusb_cdcacm_write_flush(itf, 0);
+}
+
+static void reset_one(int pin)
+{
+    int asserted_level = s_reset_cfg.default_level ? 0 : 1;
+    gpio_set_level(pin, asserted_level);
+    vTaskDelay(pdMS_TO_TICKS(s_reset_cfg.pulse_ms));
+    gpio_set_level(pin, s_reset_cfg.default_level);
+}
+
+static void reset_sequence(const char *order)
+{
+    for (size_t i = 0; order[i] != '\0'; i++) {
+        int pin = order[i] == '1' ? RESET_PIN_1 : RESET_PIN_2;
+        reset_one(pin);
+        if (order[i + 1] != '\0') {
+            vTaskDelay(pdMS_TO_TICKS(s_reset_cfg.interval_ms));
+        }
+    }
+}
+
+static void enter_download_mode(void);
+
+static bool cdc_handle_line(int itf, char *line)
+{
+    unsigned interval_ms;
+    unsigned pulse_ms;
+    unsigned default_level;
+
+    if (strcmp(line, "AT") == 0) {
+        cdc_reply(itf, "OK");
+    } else if (strcmp(line, "AT+RST=1") == 0) {
+        reset_cmd_t cmd = { .itf = itf, .order = "1" };
+        if (xQueueSend(s_reset_queue, &cmd, 0) != pdTRUE) cdc_reply(itf, "ERROR");
+    } else if (strcmp(line, "AT+RST=2") == 0) {
+        reset_cmd_t cmd = { .itf = itf, .order = "2" };
+        if (xQueueSend(s_reset_queue, &cmd, 0) != pdTRUE) cdc_reply(itf, "ERROR");
+    } else if (strcmp(line, "AT+RST=12") == 0 || strcmp(line, "AT+RST=BOTH") == 0) {
+        reset_cmd_t cmd = { .itf = itf, .order = "12" };
+        if (xQueueSend(s_reset_queue, &cmd, 0) != pdTRUE) cdc_reply(itf, "ERROR");
+    } else if (strcmp(line, "AT+RST=21") == 0) {
+        reset_cmd_t cmd = { .itf = itf, .order = "21" };
+        if (xQueueSend(s_reset_queue, &cmd, 0) != pdTRUE) cdc_reply(itf, "ERROR");
+    } else if (strcmp(line, "AT+RSTCFG?") == 0) {
+        char response[128];
+        snprintf(response, sizeof(response),
+                 "+RSTCFG:PIN1=%d,PIN2=%d,INTERVAL=%" PRIu32 ",PULSE=%" PRIu32 ",DEFAULT=%u",
+                 RESET_PIN_1, RESET_PIN_2, s_reset_cfg.interval_ms,
+                 s_reset_cfg.pulse_ms, s_reset_cfg.default_level);
+        cdc_reply(itf, response);
+    } else if (sscanf(line, "AT+RSTCFG=%u,%u,%u", &interval_ms, &pulse_ms, &default_level) == 3 &&
+               interval_ms <= 60000 && pulse_ms > 0 && pulse_ms <= 60000 && default_level <= 1) {
+        s_reset_cfg.interval_ms = interval_ms;
+        s_reset_cfg.pulse_ms = pulse_ms;
+        s_reset_cfg.default_level = (uint8_t)default_level;
+        gpio_set_level(RESET_PIN_1, s_reset_cfg.default_level);
+        gpio_set_level(RESET_PIN_2, s_reset_cfg.default_level);
+        cdc_reply(itf, "OK");
+    } else if (strcmp(line, "AT+DL") == 0 || strcmp(line, "dl") == 0) {
+        enter_download_mode();
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static void reset_task(void *arg)
+{
+    (void)arg;
+    reset_cmd_t cmd;
+
+    while (1) {
+        if (xQueueReceive(s_reset_queue, &cmd, portMAX_DELAY) == pdTRUE) {
+            reset_sequence(cmd.order);
+            cdc_reply(cmd.itf, "OK");
+        }
+    }
+}
+
+static void reset_gpio_init(void)
+{
+    gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << RESET_PIN_1) | (1ULL << RESET_PIN_2),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&cfg));
+    gpio_set_level(RESET_PIN_1, s_reset_cfg.default_level);
+    gpio_set_level(RESET_PIN_2, s_reset_cfg.default_level);
+}
+
+/* ---------------- 诊断命令 ---------------- */
 
 /* 进入下载模式：置 force_download_boot 后软复位，ROM bootloader 进 UART 下载 */
 static void enter_download_mode(void)
@@ -57,40 +185,6 @@ static void enter_download_mode(void)
     esp_rom_software_reset_system();
 }
 
-/* 内部环回自检：UART 本地回环（TX 直通 RX），验证 UART 驱动 + 通道映射 */
-static void loopback_selftest(int ch)
-{
-    const char *msg = "SELFTEST-CH0-OK";
-    if (ch == 1) msg = "SELFTEST-CH1-OK";
-    int un = s_ch[ch].uart_num;
-    uint8_t rbuf[64] = {0};
-
-    uart_flush_input(un);
-    ESP_ERROR_CHECK(uart_set_loop_back(un, true));
-    uart_write_bytes(un, msg, strlen(msg));
-    int n = uart_read_bytes(un, rbuf, strlen(msg), pdMS_TO_TICKS(200));
-    ESP_ERROR_CHECK(uart_set_loop_back(un, false));
-
-    if (n == (int)strlen(msg) && memcmp(rbuf, msg, n) == 0) {
-        ESP_LOGI(TAG, "ch%d loopback PASS (%d bytes)", ch, n);
-        tinyusb_cdcacm_write_queue(ch, (const uint8_t *)"LOOPBACK PASS\r\n", 15);
-    } else {
-        ESP_LOGE(TAG, "ch%d loopback FAIL (got %d)", ch, n);
-        tinyusb_cdcacm_write_queue(ch, (const uint8_t *)"LOOPBACK FAIL\r\n", 15);
-    }
-    tinyusb_cdcacm_write_flush(ch, 0);
-}
-
-/* CDC0 行命令解析：lb / dl */
-static void handle_cmd(const uint8_t *line, size_t len)
-{
-    if (len == 2 && memcmp(line, "lb", 2) == 0) {
-        for (int ch = 0; ch < NUM_CDC; ch++) loopback_selftest(ch);
-    } else if (len == 2 && memcmp(line, "dl", 2) == 0) {
-        enter_download_mode();
-    }
-}
-
 /* ---------------- USB -> UART ---------------- */
 
 static void cdc_rx_cb(int itf, cdcacm_event_t *event)
@@ -98,26 +192,52 @@ static void cdc_rx_cb(int itf, cdcacm_event_t *event)
     (void)event;
     uint8_t buf[CDC_RX_BUF_SIZE];
     size_t rx = 0;
+    static uint8_t cmd_buf[NUM_CDC][96];
+    static size_t cmd_len[NUM_CDC];
+    static bool cmd_candidate[NUM_CDC];
+
     while (tinyusb_cdcacm_read(itf, buf, sizeof(buf), &rx) == ESP_OK && rx > 0) {
-        /* CDC0 透传前先提取行命令（仅识别完整行，不影响透传数据） */
-        if (itf == 0) {
-            static uint8_t cmd_buf[32];
-            static size_t cmd_len = 0;
-            for (size_t i = 0; i < rx; i++) {
-                uint8_t c = buf[i];
-                if (c == '\r' || c == '\n') {
-                    if (cmd_len > 0) {
-                        handle_cmd(cmd_buf, cmd_len);
-                        cmd_len = 0;
-                    }
-                } else if (cmd_len < sizeof(cmd_buf)) {
-                    cmd_buf[cmd_len++] = c;
+        for (size_t i = 0; i < rx; i++) {
+            uint8_t c = buf[i];
+
+            if (!cmd_candidate[itf]) {
+                if (c == 'A' || c == 'd') {
+                    cmd_candidate[itf] = true;
+                    cmd_len[itf] = 1;
+                    cmd_buf[itf][0] = c;
                 } else {
-                    cmd_len = 0;  /* 超长行丢弃 */
+                    uart_write_bytes(s_ch[itf].uart_num, &c, 1);
                 }
+                continue;
+            }
+
+            if (cmd_len[itf] < sizeof(cmd_buf[itf]) - 1) {
+                cmd_buf[itf][cmd_len[itf]++] = c;
+            } else {
+                uart_write_bytes(s_ch[itf].uart_num, cmd_buf[itf], cmd_len[itf]);
+                uart_write_bytes(s_ch[itf].uart_num, &c, 1);
+                cmd_len[itf] = 0;
+                cmd_candidate[itf] = false;
+                continue;
+            }
+
+            if (c == '\r' || c == '\n') {
+                size_t line_len = cmd_len[itf];
+                while (line_len > 0 &&
+                       (cmd_buf[itf][line_len - 1] == '\r' || cmd_buf[itf][line_len - 1] == '\n')) {
+                    line_len--;
+                }
+                uint8_t delimiter = cmd_buf[itf][line_len];
+                cmd_buf[itf][line_len] = '\0';
+                bool handled = cdc_handle_line(itf, (char *)cmd_buf[itf]);
+                cmd_buf[itf][line_len] = delimiter;
+                if (!handled) {
+                    uart_write_bytes(s_ch[itf].uart_num, cmd_buf[itf], cmd_len[itf]);
+                }
+                cmd_len[itf] = 0;
+                cmd_candidate[itf] = false;
             }
         }
-        uart_write_bytes(s_ch[itf].uart_num, buf, rx);
     }
 }
 
@@ -197,6 +317,11 @@ void app_main(void)
     ESP_LOGI(TAG, "USB composite: 2x CDC <-> 2x UART (3.3V TTL)");
     ESP_LOGI(TAG, "  CDC0 <-> UART1 TX=%d RX=%d", s_ch[0].tx_pin, s_ch[0].rx_pin);
     ESP_LOGI(TAG, "  CDC1 <-> UART2 TX=%d RX=%d", s_ch[1].tx_pin, s_ch[1].rx_pin);
+
+    reset_gpio_init();
+    s_reset_queue = xQueueCreate(4, sizeof(reset_cmd_t));
+    assert(s_reset_queue);
+    xTaskCreate(reset_task, "reset_task", 3072, NULL, 11, NULL);
 
     for (int ch = 0; ch < NUM_CDC; ch++) {
         bridge_uart_init(ch);
