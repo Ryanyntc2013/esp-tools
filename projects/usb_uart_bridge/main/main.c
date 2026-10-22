@@ -7,7 +7,8 @@
  *     CDC1 (COMy) <-> UART2: TX=GPIO15, RX=GPIO16
  * - 各通道主机端设置的波特率等参数独立同步到对应 UART
  * - 两个 CDC 口均解析 AT 复位指令，响应返回原端口；协议见 docs/at-rst-control.md
- * - 复位输出 GPIO4/GPIO5：默认电平、脉冲宽度、双路间隔均可运行时配置
+ * - 复位输出 GPIO4/GPIO5/GPIO6（3 台设备）：每脚独立的脉冲宽度与默认电平，
+ *   多路复位序列的间隔共享；均可运行时配置
  * - ESP32-S3 USB 端点限制：TINYUSB_CDC_COUNT 最大为 2
  */
 #include <stdint.h>
@@ -33,6 +34,8 @@
 
 #define RESET_PIN_1         4
 #define RESET_PIN_2         5
+#define RESET_PIN_3         6
+#define RESET_PIN_COUNT     3
 #define RESET_INTERVAL_MS_DEFAULT 100
 #define RESET_PULSE_MS_DEFAULT    100
 #define RESET_DEFAULT_LEVEL_DEFAULT 0
@@ -57,23 +60,56 @@ static const char *TAG = "bridge";
 static RingbufHandle_t s_uart_rx_ring[NUM_CDC];
 static volatile bool s_usb_opened[NUM_CDC];  /* 主机已打开端口(DTR=1)才向 USB 转发 */
 
+/* 每个复位脚独立配置：脉冲宽度 + 空闲默认电平 */
 typedef struct {
-    uint32_t interval_ms;
     uint32_t pulse_ms;
     uint8_t default_level;
-} reset_cfg_t;
+} reset_pin_cfg_t;
 
-static reset_cfg_t s_reset_cfg = {
-    RESET_INTERVAL_MS_DEFAULT,
-    RESET_PULSE_MS_DEFAULT,
-    RESET_DEFAULT_LEVEL_DEFAULT,
+static const int s_reset_pins[RESET_PIN_COUNT] = {
+    RESET_PIN_1, RESET_PIN_2, RESET_PIN_3,
+};
+
+/* 多路复位序列时相邻脉冲之间的间隔（三路共享） */
+static uint32_t s_reset_interval_ms = RESET_INTERVAL_MS_DEFAULT;
+
+static reset_pin_cfg_t s_reset_cfg[RESET_PIN_COUNT] = {
+    { RESET_PULSE_MS_DEFAULT, RESET_DEFAULT_LEVEL_DEFAULT },
+    { RESET_PULSE_MS_DEFAULT, RESET_DEFAULT_LEVEL_DEFAULT },
+    { RESET_PULSE_MS_DEFAULT, RESET_DEFAULT_LEVEL_DEFAULT },
 };
 static QueueHandle_t s_reset_queue;
 
 typedef struct {
     int itf;
-    char order[3];
+    char order[4];   /* '1'..'3' 的排列，例如 "123" / "31" */
 } reset_cmd_t;
+
+/* 把 '1'..'3' 映射为 0..2 的引脚下标，非法返回 -1 */
+static int reset_order_to_index(char c)
+{
+    if (c < '1' || c > '1' + (RESET_PIN_COUNT - 1)) return -1;
+    return c - '1';
+}
+
+/* 解析复位顺序：只允许 '1'..'3'，长度 1..3，不允许重复；"BOTH"/"ALL" 为别名 */
+static bool parse_reset_order(const char *s, char *out, size_t out_size)
+{
+    if (strcmp(s, "BOTH") == 0) s = "12";
+    else if (strcmp(s, "ALL") == 0) s = "123";
+
+    size_t len = strlen(s);
+    if (len == 0 || len >= out_size) return false;
+    bool seen[RESET_PIN_COUNT] = { false };
+    for (size_t i = 0; i < len; i++) {
+        int idx = reset_order_to_index(s[i]);
+        if (idx < 0 || seen[idx]) return false;
+        seen[idx] = true;
+        out[i] = s[i];
+    }
+    out[len] = '\0';
+    return true;
+}
 
 /* ---------------- 复位与 AT 控制 ---------------- */
 
@@ -84,61 +120,81 @@ static void cdc_reply(int itf, const char *text)
     tinyusb_cdcacm_write_flush(itf, 0);
 }
 
-static void reset_one(int pin)
+static void reset_one(int idx)
 {
-    int asserted_level = s_reset_cfg.default_level ? 0 : 1;
+    const int pin = s_reset_pins[idx];
+    const reset_pin_cfg_t *cfg = &s_reset_cfg[idx];
+    int asserted_level = cfg->default_level ? 0 : 1;
     gpio_set_level(pin, asserted_level);
-    vTaskDelay(pdMS_TO_TICKS(s_reset_cfg.pulse_ms));
-    gpio_set_level(pin, s_reset_cfg.default_level);
+    vTaskDelay(pdMS_TO_TICKS(cfg->pulse_ms));
+    gpio_set_level(pin, cfg->default_level);
 }
 
 static void reset_sequence(const char *order)
 {
     for (size_t i = 0; order[i] != '\0'; i++) {
-        int pin = order[i] == '1' ? RESET_PIN_1 : RESET_PIN_2;
-        reset_one(pin);
+        reset_one(reset_order_to_index(order[i]));
         if (order[i + 1] != '\0') {
-            vTaskDelay(pdMS_TO_TICKS(s_reset_cfg.interval_ms));
+            vTaskDelay(pdMS_TO_TICKS(s_reset_interval_ms));
         }
     }
 }
 
 static void enter_download_mode(void);
 
+/* 设置单个复位脚参数；pin 为 1..RESET_PIN_COUNT */
+static void apply_pin_cfg(int pin, uint32_t pulse_ms, uint8_t default_level)
+{
+    int idx = reset_order_to_index((char)('0' + pin));
+    s_reset_cfg[idx].pulse_ms = pulse_ms;
+    s_reset_cfg[idx].default_level = default_level;
+    gpio_set_level(s_reset_pins[idx], default_level);
+}
+
 static bool cdc_handle_line(int itf, char *line)
 {
+    static const char cmd_prefix[] = "AT+RST=";
     unsigned interval_ms;
+    unsigned pin;
     unsigned pulse_ms;
     unsigned default_level;
+    char order[4];
 
     if (strcmp(line, "AT") == 0) {
         cdc_reply(itf, "OK");
-    } else if (strcmp(line, "AT+RST=1") == 0) {
-        reset_cmd_t cmd = { .itf = itf, .order = "1" };
-        if (xQueueSend(s_reset_queue, &cmd, 0) != pdTRUE) cdc_reply(itf, "ERROR");
-    } else if (strcmp(line, "AT+RST=2") == 0) {
-        reset_cmd_t cmd = { .itf = itf, .order = "2" };
-        if (xQueueSend(s_reset_queue, &cmd, 0) != pdTRUE) cdc_reply(itf, "ERROR");
-    } else if (strcmp(line, "AT+RST=12") == 0 || strcmp(line, "AT+RST=BOTH") == 0) {
-        reset_cmd_t cmd = { .itf = itf, .order = "12" };
-        if (xQueueSend(s_reset_queue, &cmd, 0) != pdTRUE) cdc_reply(itf, "ERROR");
-    } else if (strcmp(line, "AT+RST=21") == 0) {
-        reset_cmd_t cmd = { .itf = itf, .order = "21" };
+    } else if (strncmp(line, cmd_prefix, sizeof(cmd_prefix) - 1) == 0 &&
+               parse_reset_order(line + sizeof(cmd_prefix) - 1, order, sizeof(order))) {
+        reset_cmd_t cmd = { .itf = itf };
+        memcpy(cmd.order, order, sizeof(cmd.order));
         if (xQueueSend(s_reset_queue, &cmd, 0) != pdTRUE) cdc_reply(itf, "ERROR");
     } else if (strcmp(line, "AT+RSTCFG?") == 0) {
-        char response[128];
-        snprintf(response, sizeof(response),
-                 "+RSTCFG:PIN1=%d,PIN2=%d,INTERVAL=%" PRIu32 ",PULSE=%" PRIu32 ",DEFAULT=%u",
-                 RESET_PIN_1, RESET_PIN_2, s_reset_cfg.interval_ms,
-                 s_reset_cfg.pulse_ms, s_reset_cfg.default_level);
+        char response[192];
+        int n = snprintf(response, sizeof(response), "+RSTCFG:INTERVAL=%" PRIu32,
+                         s_reset_interval_ms);
+        for (int i = 0; i < RESET_PIN_COUNT && n > 0 && n < (int)sizeof(response); i++) {
+            n += snprintf(response + n, sizeof(response) - n,
+                          ",PIN%d=%d,PULSE%d=%" PRIu32 ",DEFAULT%d=%u",
+                          i + 1, s_reset_pins[i], i + 1,
+                          s_reset_cfg[i].pulse_ms, i + 1,
+                          s_reset_cfg[i].default_level);
+        }
         cdc_reply(itf, response);
-    } else if (sscanf(line, "AT+RSTCFG=%u,%u,%u", &interval_ms, &pulse_ms, &default_level) == 3 &&
+    } else if (sscanf(line, "AT+RSTCFG=%u,%u,%u,%u", &interval_ms, &pin, &pulse_ms,
+                      &default_level) == 4 &&
+               interval_ms <= 60000 && pin >= 1 && pin <= RESET_PIN_COUNT &&
+               pulse_ms > 0 && pulse_ms <= 60000 && default_level <= 1) {
+        /* 单脚配置：AT+RSTCFG=<间隔>,<脚号>,<脉冲>,<默认电平> */
+        s_reset_interval_ms = interval_ms;
+        apply_pin_cfg((int)pin, pulse_ms, (uint8_t)default_level);
+        cdc_reply(itf, "OK");
+    } else if (sscanf(line, "AT+RSTCFG=%u,%u,%u", &interval_ms, &pulse_ms,
+                      &default_level) == 3 &&
                interval_ms <= 60000 && pulse_ms > 0 && pulse_ms <= 60000 && default_level <= 1) {
-        s_reset_cfg.interval_ms = interval_ms;
-        s_reset_cfg.pulse_ms = pulse_ms;
-        s_reset_cfg.default_level = (uint8_t)default_level;
-        gpio_set_level(RESET_PIN_1, s_reset_cfg.default_level);
-        gpio_set_level(RESET_PIN_2, s_reset_cfg.default_level);
+        /* 全局配置：AT+RSTCFG=<间隔>,<脉冲>,<默认电平>，对所有复位脚生效 */
+        s_reset_interval_ms = interval_ms;
+        for (int i = 0; i < RESET_PIN_COUNT; i++) {
+            apply_pin_cfg(i + 1, pulse_ms, (uint8_t)default_level);
+        }
         cdc_reply(itf, "OK");
     } else if (strcmp(line, "AT+DL") == 0 || strcmp(line, "dl") == 0) {
         enter_download_mode();
@@ -163,16 +219,21 @@ static void reset_task(void *arg)
 
 static void reset_gpio_init(void)
 {
+    uint64_t mask = 0;
+    for (int i = 0; i < RESET_PIN_COUNT; i++) {
+        mask |= (1ULL << s_reset_pins[i]);
+    }
     gpio_config_t cfg = {
-        .pin_bit_mask = (1ULL << RESET_PIN_1) | (1ULL << RESET_PIN_2),
+        .pin_bit_mask = mask,
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
     ESP_ERROR_CHECK(gpio_config(&cfg));
-    gpio_set_level(RESET_PIN_1, s_reset_cfg.default_level);
-    gpio_set_level(RESET_PIN_2, s_reset_cfg.default_level);
+    for (int i = 0; i < RESET_PIN_COUNT; i++) {
+        gpio_set_level(s_reset_pins[i], s_reset_cfg[i].default_level);
+    }
 }
 
 /* ---------------- 诊断命令 ---------------- */
@@ -317,6 +378,7 @@ void app_main(void)
     ESP_LOGI(TAG, "USB composite: 2x CDC <-> 2x UART (3.3V TTL)");
     ESP_LOGI(TAG, "  CDC0 <-> UART1 TX=%d RX=%d", s_ch[0].tx_pin, s_ch[0].rx_pin);
     ESP_LOGI(TAG, "  CDC1 <-> UART2 TX=%d RX=%d", s_ch[1].tx_pin, s_ch[1].rx_pin);
+    ESP_LOGI(TAG, "  RESET out: GPIO%d/GPIO%d/GPIO%d", RESET_PIN_1, RESET_PIN_2, RESET_PIN_3);
 
     reset_gpio_init();
     s_reset_queue = xQueueCreate(4, sizeof(reset_cmd_t));
