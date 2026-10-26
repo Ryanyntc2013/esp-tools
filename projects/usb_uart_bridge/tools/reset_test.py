@@ -78,7 +78,7 @@ class RstController:
         return out
 
     def configure(self, interval_ms, pulse_ms, default_level):
-        """统一配置三路参数"""
+        """统一配置全部六路参数"""
         assert 0 <= interval_ms <= MAX_INTERVAL, "间隔越界"
         assert 1 <= pulse_ms <= MAX_PULSE, "脉冲越界"
         assert default_level in (0, 1), "默认电平只能为 0 或 1"
@@ -136,7 +136,7 @@ class RstController:
         return int(r.rsplit("=", 1)[1])
 
     def reset(self, order):
-        """order: '1'/'2'/'3'/'12'/'21'/'123'/'ALL'/'BOTH' 等"""
+        """order: 1..6 的不重复排列，如 '1'/'12'/'456'/'123456'；别名 'ALL'/'BOTH'"""
         if order == "BOTH":
             order = "12"
         elif order == "ALL":

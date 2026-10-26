@@ -40,8 +40,17 @@ verification*.log
 Thumbs.db
 Desktop.ini
 
+# Python 打包产物
+dist/
+*.egg-info/
+build/bdist.*/
+*.whl
+
 # 临时
 *.tmp
 *.bak
 *.swp
 *~
+
+# MCP 分发包（本地生成，不入库；用 scripts 重新打包）
+usb-uart-bridge-mcp-*.zip

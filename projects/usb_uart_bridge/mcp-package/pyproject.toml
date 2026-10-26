@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "usb-uart-bridge-mcp"
+version = "1.1.0"
+description = "MCP server for ESP32-S3 usb_uart_bridge: 6-ch reset control and level sensing over USB CDC"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "esp-tools" }]
+keywords = ["mcp", "esp32", "usb", "cdc", "reset", "serial"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Embedded Systems",
+]
+dependencies = ["pyserial>=3.5"]
+
+[project.scripts]
+usb-uart-bridge-mcp = "usb_uart_bridge_mcp.server:main"
+
+[tool.setuptools]
+packages = ["usb_uart_bridge_mcp"]
