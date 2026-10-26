@@ -7,7 +7,7 @@
  *     CDC1 (COMy) <-> UART2: TX=GPIO15, RX=GPIO16
  * - 各通道主机端设置的波特率等参数独立同步到对应 UART
  * - 两个 CDC 口均解析 AT 复位指令，响应返回原端口；协议见 docs/at-rst-control.md
- * - 复位输出 GPIO4/GPIO5/GPIO6（3 台设备）：每脚独立的脉冲宽度与默认电平，
+ * - 复位输出 GPIO4/5/6/7/8/9（6 台设备）：每脚独立的脉冲宽度与默认电平，
  *   多路复位序列的间隔共享；均可运行时配置
  * - ESP32-S3 USB 端点限制：TINYUSB_CDC_COUNT 最大为 2
  */
@@ -35,7 +35,10 @@
 #define RESET_PIN_1         4
 #define RESET_PIN_2         5
 #define RESET_PIN_3         6
-#define RESET_PIN_COUNT     3
+#define RESET_PIN_4         7
+#define RESET_PIN_5         8
+#define RESET_PIN_6         9
+#define RESET_PIN_COUNT     6
 #define RESET_INTERVAL_MS_DEFAULT 100
 #define RESET_PULSE_MS_DEFAULT    100
 #define RESET_DEFAULT_LEVEL_DEFAULT 0
@@ -68,38 +71,50 @@ typedef struct {
 
 static const int s_reset_pins[RESET_PIN_COUNT] = {
     RESET_PIN_1, RESET_PIN_2, RESET_PIN_3,
+    RESET_PIN_4, RESET_PIN_5, RESET_PIN_6,
 };
 
-/* 多路复位序列时相邻脉冲之间的间隔（三路共享） */
+/* 多路复位序列时相邻脉冲之间的间隔（各路共享） */
 static uint32_t s_reset_interval_ms = RESET_INTERVAL_MS_DEFAULT;
 
+/* 空闲高阻模式：平时引脚为输入(高阻)，仅在复位脉冲期间临时切为输出。
+ * 可避免持续驱动目标 MCU 的复位脚造成电平冲突/漏电。 */
+static bool s_reset_idle_high_z = true;
+
 static reset_pin_cfg_t s_reset_cfg[RESET_PIN_COUNT] = {
+    { RESET_PULSE_MS_DEFAULT, RESET_DEFAULT_LEVEL_DEFAULT },
+    { RESET_PULSE_MS_DEFAULT, RESET_DEFAULT_LEVEL_DEFAULT },
+    { RESET_PULSE_MS_DEFAULT, RESET_DEFAULT_LEVEL_DEFAULT },
     { RESET_PULSE_MS_DEFAULT, RESET_DEFAULT_LEVEL_DEFAULT },
     { RESET_PULSE_MS_DEFAULT, RESET_DEFAULT_LEVEL_DEFAULT },
     { RESET_PULSE_MS_DEFAULT, RESET_DEFAULT_LEVEL_DEFAULT },
 };
 static QueueHandle_t s_reset_queue;
 
+/* 复位顺序串：1..RESET_PIN_COUNT 的不重复排列，最多 RESET_PIN_COUNT 个字符 + '\0' */
+#define RESET_ORDER_MAX_LEN (RESET_PIN_COUNT + 1)
+
 typedef struct {
     int itf;
-    char order[4];   /* '1'..'3' 的排列，例如 "123" / "31" */
+    char order[RESET_ORDER_MAX_LEN];
 } reset_cmd_t;
 
-/* 把 '1'..'3' 映射为 0..2 的引脚下标，非法返回 -1 */
+/* 把 '1'..'6' 映射为 0..5 的引脚下标，非法返回 -1 */
 static int reset_order_to_index(char c)
 {
     if (c < '1' || c > '1' + (RESET_PIN_COUNT - 1)) return -1;
     return c - '1';
 }
 
-/* 解析复位顺序：只允许 '1'..'3'，长度 1..3，不允许重复；"BOTH"/"ALL" 为别名 */
+/* 解析复位顺序：只允许 '1'..'6'，长度 1..6，不允许重复；"BOTH"/"ALL" 为别名 */
 static bool parse_reset_order(const char *s, char *out, size_t out_size)
 {
     if (strcmp(s, "BOTH") == 0) s = "12";
-    else if (strcmp(s, "ALL") == 0) s = "123";
+    else if (strcmp(s, "ALL") == 0) s = "123456";
 
     size_t len = strlen(s);
     if (len == 0 || len >= out_size) return false;
+
     bool seen[RESET_PIN_COUNT] = { false };
     for (size_t i = 0; i < len; i++) {
         int idx = reset_order_to_index(s[i]);
@@ -120,14 +135,44 @@ static void cdc_reply(int itf, const char *text)
     tinyusb_cdcacm_write_flush(itf, 0);
 }
 
+/* 引脚切为"高阻空闲"：关闭输出与上下拉，但保留输入使能以便读取目标电平。
+ * 输入使能不会向外部驱动电流（仅高阻采样），对外仍是高阻。 */
+static void reset_pin_high_z(int pin)
+{
+    gpio_set_direction((gpio_num_t)pin, GPIO_MODE_INPUT);
+    gpio_pullup_dis((gpio_num_t)pin);
+    gpio_pulldown_dis((gpio_num_t)pin);
+}
+
+/* 引脚切为推挽输出，并立即驱动到指定电平 */
+static void reset_pin_drive(int pin, int level)
+{
+    gpio_set_level((gpio_num_t)pin, level);          /* 先设电平，避免切换瞬间毛刺 */
+    gpio_set_direction((gpio_num_t)pin, GPIO_MODE_OUTPUT);
+}
+
+/* 读取单个复位脚的当前电平（高阻模式下为外部真实电平） */
+static int reset_pin_read(int idx)
+{
+    return gpio_get_level((gpio_num_t)s_reset_pins[idx]);
+}
+
 static void reset_one(int idx)
 {
     const int pin = s_reset_pins[idx];
     const reset_pin_cfg_t *cfg = &s_reset_cfg[idx];
-    int asserted_level = cfg->default_level ? 0 : 1;
-    gpio_set_level(pin, asserted_level);
-    vTaskDelay(pdMS_TO_TICKS(cfg->pulse_ms));
-    gpio_set_level(pin, cfg->default_level);
+    const int asserted_level = cfg->default_level ? 0 : 1;
+
+    if (s_reset_idle_high_z) {
+        /* 先建立驱动电平再打开输出，脉冲结束后立刻回到高阻 */
+        reset_pin_drive(pin, asserted_level);
+        vTaskDelay(pdMS_TO_TICKS(cfg->pulse_ms));
+        reset_pin_high_z(pin);
+    } else {
+        gpio_set_level((gpio_num_t)pin, asserted_level);
+        vTaskDelay(pdMS_TO_TICKS(cfg->pulse_ms));
+        gpio_set_level((gpio_num_t)pin, cfg->default_level);
+    }
 }
 
 static void reset_sequence(const char *order)
@@ -142,13 +187,30 @@ static void reset_sequence(const char *order)
 
 static void enter_download_mode(void);
 
-/* 设置单个复位脚参数；pin 为 1..RESET_PIN_COUNT */
+/* 设置单个复位脚参数；pin 为 1..6 */
 static void apply_pin_cfg(int pin, uint32_t pulse_ms, uint8_t default_level)
 {
     int idx = reset_order_to_index((char)('0' + pin));
     s_reset_cfg[idx].pulse_ms = pulse_ms;
     s_reset_cfg[idx].default_level = default_level;
-    gpio_set_level(s_reset_pins[idx], default_level);
+
+    /* 高阻空闲模式下不主动驱动引脚；仅推挽空闲模式才立即更新空闲电平 */
+    if (!s_reset_idle_high_z) {
+        gpio_set_level((gpio_num_t)s_reset_pins[idx], default_level);
+    }
+}
+
+/* 切换空闲模式：true=高阻输入，false=推挽输出驱动到默认电平 */
+static void set_idle_high_z(bool high_z)
+{
+    s_reset_idle_high_z = high_z;
+    for (int i = 0; i < RESET_PIN_COUNT; i++) {
+        if (high_z) {
+            reset_pin_high_z(s_reset_pins[i]);
+        } else {
+            reset_pin_drive(s_reset_pins[i], s_reset_cfg[i].default_level);
+        }
+    }
 }
 
 static bool cdc_handle_line(int itf, char *line)
@@ -158,7 +220,8 @@ static bool cdc_handle_line(int itf, char *line)
     unsigned pin;
     unsigned pulse_ms;
     unsigned default_level;
-    char order[4];
+    unsigned mode;
+    char order[RESET_ORDER_MAX_LEN];
 
     if (strcmp(line, "AT") == 0) {
         cdc_reply(itf, "OK");
@@ -168,9 +231,11 @@ static bool cdc_handle_line(int itf, char *line)
         memcpy(cmd.order, order, sizeof(cmd.order));
         if (xQueueSend(s_reset_queue, &cmd, 0) != pdTRUE) cdc_reply(itf, "ERROR");
     } else if (strcmp(line, "AT+RSTCFG?") == 0) {
-        char response[192];
-        int n = snprintf(response, sizeof(response), "+RSTCFG:INTERVAL=%" PRIu32,
-                         s_reset_interval_ms);
+        /* 6 路时约 200 字节，留足余量 */
+        char response[256];
+        int n = snprintf(response, sizeof(response),
+                         "+RSTCFG:INTERVAL=%" PRIu32 ",IDLE=%s",
+                         s_reset_interval_ms, s_reset_idle_high_z ? "HIGHZ" : "DRIVE");
         for (int i = 0; i < RESET_PIN_COUNT && n > 0 && n < (int)sizeof(response); i++) {
             n += snprintf(response + n, sizeof(response) - n,
                           ",PIN%d=%d,PULSE%d=%" PRIu32 ",DEFAULT%d=%u",
@@ -178,6 +243,28 @@ static bool cdc_handle_line(int itf, char *line)
                           s_reset_cfg[i].pulse_ms, i + 1,
                           s_reset_cfg[i].default_level);
         }
+        cdc_reply(itf, response);
+    } else if (strcmp(line, "AT+RSTMODE?") == 0) {
+        cdc_reply(itf, s_reset_idle_high_z ? "+RSTMODE:HIGHZ" : "+RSTMODE:DRIVE");
+    } else if (sscanf(line, "AT+RSTMODE=%u", &mode) == 1 && mode <= 1) {
+        /* 1/0 两种写法：1=高阻空闲(默认)，0=推挽空闲并驱动到默认电平 */
+        set_idle_high_z(mode != 0);
+        cdc_reply(itf, "OK");
+    } else if (strcmp(line, "AT+RSTLVL") == 0 || strcmp(line, "AT+RSTLVL?") == 0) {
+        /* 读取全部复位脚当前电平；HIGHZ 模式读到的是目标板真实电平 */
+        char response[96];
+        int n = snprintf(response, sizeof(response), "+RSTLVL:");
+        for (int i = 0; i < RESET_PIN_COUNT && n > 0 && n < (int)sizeof(response); i++) {
+            n += snprintf(response + n, sizeof(response) - n, "%sP%d=%d",
+                          i == 0 ? "" : ",", i + 1, reset_pin_read(i));
+        }
+        cdc_reply(itf, response);
+    } else if ((strncmp(line, "AT+RSTLVL=", 10) == 0) &&
+               sscanf(line + 10, "%u", &pin) == 1 && pin >= 1 && pin <= RESET_PIN_COUNT) {
+        /* 读取单个复位脚电平 */
+        char response[32];
+        snprintf(response, sizeof(response), "+RSTLVL:P%u=%d",
+                 pin, reset_pin_read((int)pin - 1));
         cdc_reply(itf, response);
     } else if (sscanf(line, "AT+RSTCFG=%u,%u,%u,%u", &interval_ms, &pin, &pulse_ms,
                       &default_level) == 4 &&
@@ -219,21 +306,39 @@ static void reset_task(void *arg)
 
 static void reset_gpio_init(void)
 {
+    /* 先把引脚初始化为高阻输入（无上下拉），避免上电瞬间驱动目标复位脚 */
     uint64_t mask = 0;
     for (int i = 0; i < RESET_PIN_COUNT; i++) {
         mask |= (1ULL << s_reset_pins[i]);
     }
     gpio_config_t cfg = {
         .pin_bit_mask = mask,
-        .mode = GPIO_MODE_OUTPUT,
+        .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
     ESP_ERROR_CHECK(gpio_config(&cfg));
+
     for (int i = 0; i < RESET_PIN_COUNT; i++) {
-        gpio_set_level(s_reset_pins[i], s_reset_cfg[i].default_level);
+        reset_pin_high_z(s_reset_pins[i]);
     }
+
+    if (!s_reset_idle_high_z) {
+        /* 推挽空闲模式：切为输出并驱动到默认电平 */
+        gpio_config_t out_cfg = {
+            .pin_bit_mask = mask,
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        ESP_ERROR_CHECK(gpio_config(&out_cfg));
+        for (int i = 0; i < RESET_PIN_COUNT; i++) {
+            gpio_set_level((gpio_num_t)s_reset_pins[i], s_reset_cfg[i].default_level);
+        }
+    }
+    ESP_LOGI(TAG, "reset pins idle mode: %s", s_reset_idle_high_z ? "HIGH-Z (input)" : "driven");
 }
 
 /* ---------------- 诊断命令 ---------------- */
@@ -378,7 +483,9 @@ void app_main(void)
     ESP_LOGI(TAG, "USB composite: 2x CDC <-> 2x UART (3.3V TTL)");
     ESP_LOGI(TAG, "  CDC0 <-> UART1 TX=%d RX=%d", s_ch[0].tx_pin, s_ch[0].rx_pin);
     ESP_LOGI(TAG, "  CDC1 <-> UART2 TX=%d RX=%d", s_ch[1].tx_pin, s_ch[1].rx_pin);
-    ESP_LOGI(TAG, "  RESET out: GPIO%d/GPIO%d/GPIO%d", RESET_PIN_1, RESET_PIN_2, RESET_PIN_3);
+    ESP_LOGI(TAG, "  RESET out: GPIO%d/GPIO%d/GPIO%d/GPIO%d/GPIO%d/GPIO%d",
+             RESET_PIN_1, RESET_PIN_2, RESET_PIN_3,
+             RESET_PIN_4, RESET_PIN_5, RESET_PIN_6);
 
     reset_gpio_init();
     s_reset_queue = xQueueCreate(4, sizeof(reset_cmd_t));
